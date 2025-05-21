@@ -6,6 +6,7 @@ import {useGetBalance, useGetTokenAccounts, useTransferSol} from '../account/acc
 import {address, lamportsToSol} from 'gill';
 import React from 'react';
 import {WalletButton} from '../solana/solana-provider';
+import {Transaction, VersionedTransaction, Connection, clusterApiUrl, TransactionSignature} from '@solana/web3.js';
 
 interface Message {
     type: 'user' | 'ai';
@@ -15,13 +16,54 @@ interface Message {
 
 interface TransactionRequestProps {
     data: {
-        destination: string;
-        amount: number;
+        destination?: string;
+        amount?: number;
+        transaction?: string;
+        type: 'transfer' | 'swap';
+        token?: string;
     };
     onSuccess: () => void;
     onCancel: () => void;
 }
 
+// Add a Phantom wallet interface
+interface PhantomWallet {
+    isPhantom?: boolean;
+    connect: () => Promise<{publicKey: string;}>;
+    disconnect: () => Promise<void>;
+    signAndSendTransaction: (
+        transaction: Transaction,
+        options?: {skipPreflight: boolean;}
+    ) => Promise<{signature: string;}>;
+}
+
+interface WindowWithPhantom extends Window {
+    phantom?: {
+        solana?: PhantomWallet;
+    };
+}
+
+interface TransactionData {
+    destination?: string;
+    amount?: number;
+    transaction?: string;
+    type: 'transfer' | 'swap';
+    token?: string;
+}
+
+interface ApiResponse {
+    tool: string;
+    response?: string;
+    transactionData?: {
+        toAddress: string;
+        amount: number;
+    };
+    swapTransaction?: {
+        transaction: string;
+        token: string;
+        amount: number;
+    };
+}
 
 const links: string[] = [
     'List me  all the tokens I have in my wallet',
@@ -47,11 +89,69 @@ function TransactionRequest({data, onSuccess, onCancel}: TransactionRequestProps
 
             try {
                 console.log("Executing transaction", data);
-                await transferSol.mutateAsync({
-                    destination: address(data.destination),
-                    amount: data.amount,
-                });
-                onSuccess();
+
+                if (data.type === 'transfer' && data.destination && data.amount) {
+                    // Handle SOL transfer
+                    await transferSol.mutateAsync({
+                        destination: address(data.destination),
+                        amount: data.amount,
+                    });
+                    onSuccess();
+                } else if (data.type === 'swap' && data.transaction) {
+                    // Handle swap transaction
+                    console.log("Executing swap transaction");
+
+                    try {
+                        // Get the phantom wallet from window object
+                        const phantom = (window as WindowWithPhantom).phantom?.solana;
+
+                        if (!phantom || !phantom.isPhantom) {
+                            throw new Error("Phantom wallet not found");
+                        }
+
+                        console.log("Attempting to decode transaction");
+
+                        // Establish connection to Solana cluster
+                        const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || clusterApiUrl('devnet');
+                        const connection = new Connection(rpcUrl, 'confirmed');
+
+                        // Decode the base64 transaction
+                        const swapTransactionBuf = Buffer.from(data.transaction, 'base64');
+                        const versionedTransaction = VersionedTransaction.deserialize(swapTransactionBuf);
+
+                        console.log("Transaction deserialized successfully:", versionedTransaction);
+
+                        // Sign and send the transaction
+                        const signature = await phantom.signAndSendTransaction(
+                            versionedTransaction as any, // Cast to any to satisfy Phantom's type, which might not be updated for VersionedTransaction
+                            {skipPreflight: true}
+                        );
+
+                        console.log("Swap transaction sent with signature:", signature);
+
+                        // Confirm the transaction
+                        // Get the latest blockhash and last valid block height
+                        const {blockhash, lastValidBlockHeight} = await connection.getLatestBlockhash();
+                        const confirmation = await connection.confirmTransaction({
+                            signature: signature.signature as TransactionSignature,
+                            blockhash,
+                            lastValidBlockHeight
+                        }, "finalized");
+
+                        if (confirmation.value.err) {
+                            throw new Error(`Transaction failed to confirm: ${JSON.stringify(confirmation.value.err)}`);
+                        }
+
+                        console.log(`Transaction successful: https://solscan.io/tx/${signature}`);
+                        onSuccess();
+                    } catch (error) {
+                        console.error("Error sending swap transaction:", error);
+                        onCancel();
+                    }
+                } else {
+                    console.error("Invalid transaction data:", data);
+                    onCancel();
+                }
             } catch (error) {
                 console.error('Error sending transaction:', error);
                 onCancel();
@@ -75,7 +175,7 @@ export function PromptForm() {
     const [input, setInput] = useState('');
     const [conversationId, setConversationId] = useState('');
     const [isLoading, setIsLoading] = useState(false);
-    const [transactionData, setTransactionData] = useState<{destination: string; amount: number;} | null>(null);
+    const [transactionData, setTransactionData] = useState<TransactionData | null>(null);
     const chatContainerRef = useRef<HTMLDivElement>(null);
 
     const {account} = useWalletUi();
@@ -96,7 +196,6 @@ export function PromptForm() {
         }, 100);
     };
 
-
     const createConversation = async () => {
         if (conversationId) return;
 
@@ -112,14 +211,9 @@ export function PromptForm() {
             const data = await response.json();
             console.log("data", data);
             setConversationId(data.conversationId);
-            setMessages(prev => [...prev, {
-                type: 'ai',
-                content: 'Hello, I am the Solana AI Assistant. How can I help you today?',
-                timestamp: new Date()
-            }]);
+            addAiMessage('Hello, I am the Solana AI Assistant. How can I help you today?');
         } catch (error) {
             console.error('Error creating conversation:', error);
-
         }
     };
 
@@ -128,33 +222,120 @@ export function PromptForm() {
         scrollToBottom();
     };
 
+    const addUserMessage = (content: string) => {
+        setMessages(prev => [...prev, {
+            type: 'user',
+            content,
+            timestamp: new Date()
+        }]);
+    };
+
+    const addAiMessage = (content: string) => {
+        setMessages(prev => [...prev, {
+            type: 'ai',
+            content,
+            timestamp: new Date()
+        }]);
+    };
+
+    const handleError = (errorMessage: string = 'Sorry, there was an error processing your request. Please try again.') => {
+        addAiMessage(errorMessage);
+        setIsLoading(false);
+        scrollToBottom();
+    };
+
     const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         if (!input.trim()) return;
 
-        setMessages(prev => [...prev, {
-            type: 'user',
-            content: input,
-            timestamp: new Date()
-        }]);
+        addUserMessage(input);
 
         console.log("Conversation ID", conversationId, account);
 
         try {
             // Add AI response
             await sendMessage(input);
-
             setInput('');
         } catch (error) {
             console.error('Error:', error);
-            setMessages(prev => [...prev, {
-                type: 'ai',
-                content: 'Sorry, there was an error processing your request. Please try again.',
-                timestamp: new Date()
-            }]);
+            handleError();
         } finally {
             setIsLoading(false);
             scrollToBottom();
+        }
+    };
+
+    const handleSolanaBalance = () => {
+        const sol = balance.data ? `${lamportsToSol(balance.data)} SOL` : '0 SOL';
+        addAiMessage(`Your balance is ${sol}`);
+    };
+
+    const handleSendSolanaTransaction = (response: ApiResponse) => {
+        if (!response.transactionData) return;
+
+        const sol = lamportsToSol(response.transactionData.amount);
+        const destination = response.transactionData.toAddress;
+
+        setTransactionData({
+            destination: response.transactionData.toAddress,
+            amount: response.transactionData.amount,
+            type: 'transfer'
+        });
+
+        addAiMessage(`I'll help you send ${sol} SOL to ${destination}. Please confirm the transaction.`);
+    };
+
+    const handleBuyToken = (response: ApiResponse) => {
+        console.log("Buy token response:", response);
+
+        if (response.swapTransaction) {
+            setTransactionData({
+                transaction: response.swapTransaction.transaction,
+                type: 'swap',
+                token: response.swapTransaction.token,
+                amount: response.swapTransaction.amount
+            });
+
+            addAiMessage(`I'll help you buy ${response.swapTransaction.amount} of ${response.swapTransaction.token}. Please confirm the swap transaction.`);
+        } else {
+            addAiMessage(response.response || 'Unable to process buy token request');
+        }
+    };
+
+    const handleListTokens = () => {
+        console.log("List my tokens", tokenAccounts);
+        if (tokenAccounts.data) {
+            const tokenList = tokenAccounts.data.map(({account}) => ({
+                mint: account.data.parsed.info.mint,
+                balance: account.data.parsed.info.tokenAmount.uiAmount,
+                decimals: account.data.parsed.info.tokenAmount.decimals,
+            }));
+
+            console.log("Token list", tokenList);
+            if (tokenList.length > 0) {
+                const formattedTokens = tokenList.map(token =>
+                    `Token: ${token.mint}\nBalance: ${token.balance}\nDecimals: ${token.decimals}\n`
+                ).join('\n');
+
+                addAiMessage(`Here are your tokens:\n\n${formattedTokens}`);
+            } else {
+                addAiMessage('You don\'t have any tokens in your wallet.');
+            }
+        }
+    };
+
+    const processResponse = (response: ApiResponse) => {
+        if (response.tool === 'get_solana_balance' && account?.address) {
+            handleSolanaBalance();
+        } else if (response.tool === 'send_solana_transaction') {
+            handleSendSolanaTransaction(response);
+        } else if (response.tool === 'buy_token') {
+            handleBuyToken(response);
+        } else if (response.tool === 'list_my_tokens') {
+            handleListTokens();
+        } else {
+            console.log("Other tool", response);
+            addAiMessage(response.response || 'No response available');
         }
     };
 
@@ -164,7 +345,8 @@ export function PromptForm() {
                 throw new Error('No active conversation');
             }
 
-            const response = await fetch(`${API_BASE_URL}/conversations/${conversationId}/messages`, {
+            setIsLoading(true);
+            const response = await (await fetch(`${API_BASE_URL}/conversations/${conversationId}/messages`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -173,118 +355,17 @@ export function PromptForm() {
                     message,
                     walletAddress: account?.address.toString() || null,
                 }),
-            });
-
-            const data = await response.json();
-
-            if (data.tool === 'get_solana_balance' && account?.address) {
-                const sol = balance.data ? `${lamportsToSol(balance.data)} SOL` : '0 SOL';
-
-                setMessages(prev => [
-                    ...prev,
-                    {
-                        type: 'ai',
-                        content: `Your balance is ${sol}`,
-                        timestamp: new Date(),
-                    },
-                ]);
-
-            } else if (data.tool === 'send_solana_transaction') {
-                console.log("Transaction data", data);
-                const sol = lamportsToSol(data.transactionData.amount);
-                const destination = data.transactionData.toAddress;
-
-                setTransactionData({
-                    destination: data.transactionData.toAddress,
-                    amount: data.transactionData.amount
-                });
-
-                setMessages(prev => [
-                    ...prev,
-                    {
-                        type: 'ai',
-                        content: `I'll help you send ${sol} SOL to ${destination}. Please confirm the transaction.`,
-                        timestamp: new Date(),
-                    },
-                ]);
-            } else if (data.tool === 'buy_token') {
-                console.log("Buy token", data);
-
-                // setTransactionData({
-                //     destination: data.swapTransaction.toAddress,
-                //     amount: data.swapTransaction.amount
-                // });
-                setMessages(prev => [
-                    ...prev,
-                    {
-                        type: 'ai',
-                        content: `I'll help you buy ${data.token} token. Please confirm the transaction.`,
-                        timestamp: new Date(),
-                    },
-                ]);
-            } else if (data.tool === 'list_my_tokens') {
-                console.log("List my tokens", tokenAccounts);
-                if (tokenAccounts.data) {
-                    const tokenList = tokenAccounts.data.map(({account}) => ({
-                        mint: account.data.parsed.info.mint,
-                        balance: account.data.parsed.info.tokenAmount.uiAmount,
-                        decimals: account.data.parsed.info.tokenAmount.decimals,
-                    }));
-
-                    console.log("Token list", tokenList);
-                    if (tokenList.length > 0) {
-                        const formattedTokens = tokenList.map(token =>
-                            `Token: ${token.mint}\nBalance: ${token.balance}\nDecimals: ${token.decimals}\n`
-                        ).join('\n');
-
-                        setMessages(prev => [
-                            ...prev,
-                            {
-                                type: 'ai',
-                                content: `Here are your tokens:\n\n${formattedTokens}`,
-                                timestamp: new Date(),
-                            },
-                        ]);
-                    } else {
-                        setMessages(prev => [
-                            ...prev,
-                            {
-                                type: 'ai',
-                                content: 'You don\'t have any tokens in your wallet.',
-                                timestamp: new Date(),
-                            },
-                        ]);
-                    }
-                }
-            } else {
-                setMessages(prev => [
-                    ...prev,
-                    {
-                        type: 'ai',
-                        content: data.response,
-                        timestamp: new Date(),
-                    },
-                ]);
-            }
+            })).json();
 
             setIsLoading(false);
+            processResponse(response);
             scrollToBottom();
         } catch (error) {
             console.error('Error sending message:', error);
-            setIsLoading(false);
-
-            setMessages(prev => [
-                ...prev,
-                {
-                    type: 'ai',
-                    content: 'Sorry, there was an error processing your request. Please try again.',
-                    timestamp: new Date(),
-                },
-            ]);
-
-            scrollToBottom();
+            handleError();
         }
     };
+
 
     return (
         <div className="w-full max-w-2xl mx-auto p-4 border rounded-lg shadow-sm">
@@ -316,8 +397,8 @@ export function PromptForm() {
                         ))}
                         {isLoading && (
                             <div className="flex justify-start">
-                                <div className="bg-gray-100 rounded-lg p-3">
-                                    <div className="animate-spin h-4 w-4 border-2 border-blue-500 border-t-transparent rounded-full" />
+                                <div className="bg-green-700 rounded-lg p-3 flex flex-row gap-2 items-center">
+                                    Processing...<div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
                                 </div>
                             </div>
                         )}
@@ -353,8 +434,6 @@ export function PromptForm() {
                     </div>
                 </div>
             }
-
-
         </div>
     );
 }
