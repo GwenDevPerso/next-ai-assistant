@@ -5,13 +5,15 @@ import {useState, useRef} from 'react';
 import {useGetBalance, useGetTokenAccounts, useTransferSol} from '../account/account-data-access';
 import {address, lamportsToSol} from 'gill';
 import React from 'react';
-import {WalletButton} from '../solana/solana-provider';
 import {Transaction, VersionedTransaction, Connection, clusterApiUrl, TransactionSignature} from '@solana/web3.js';
+import Image from 'next/image';
+import {WalletButton} from '../solana/solana-provider';
 
 interface Message {
     type: 'user' | 'ai';
     content: string;
     timestamp: Date;
+    isFormatted?: boolean; // Add flag to indicate if content needs special formatting
 }
 
 interface TransactionRequestProps {
@@ -66,10 +68,10 @@ interface ApiResponse {
 }
 
 const links: string[] = [
-    'List me  all the tokens I have in my wallet',
+    'List me  all the tokens I have in my wallet (TODO)',
     'Give me the balance of SOL in my wallet',
     'Show me my wallet address',
-    'Buy me 1 SOL of usdc token: mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    'Buy me 1 SOL of usdc token',
     'What is the price of SOL in USD?',
     'Show me a list of all the top trending tokens',
 ];
@@ -112,9 +114,9 @@ function TransactionRequest({data, onSuccess, onCancel}: TransactionRequestProps
                         console.log("Attempting to decode transaction");
 
                         // Establish connection to Solana cluster
-                        const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || clusterApiUrl('devnet');
+                        const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || clusterApiUrl('mainnet-beta');
                         const connection = new Connection(rpcUrl, 'confirmed');
-
+                        console.log("Connection established", connection, rpcUrl);
                         // Decode the base64 transaction
                         const swapTransactionBuf = Buffer.from(data.transaction, 'base64');
                         const versionedTransaction = VersionedTransaction.deserialize(swapTransactionBuf);
@@ -123,7 +125,7 @@ function TransactionRequest({data, onSuccess, onCancel}: TransactionRequestProps
 
                         // Sign and send the transaction
                         const signature = await phantom.signAndSendTransaction(
-                            versionedTransaction as any, // Cast to any to satisfy Phantom's type, which might not be updated for VersionedTransaction
+                            versionedTransaction as unknown as Transaction, // Convert via unknown since types are not directly compatible
                             {skipPreflight: true}
                         );
 
@@ -188,6 +190,67 @@ export function PromptForm() {
 
     const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001/api';
 
+    /**
+     * Renders formatted content with proper line breaks and styling
+     */
+    const renderFormattedContent = (content: string) => {
+        return content.split('\n').map((line, index) => {
+            // Handle bold text (**text**)
+            if (line.includes('**')) {
+                const parts = line.split(/(\*\*[^*]+\*\*)/g);
+                return (
+                    <div key={index} className="mb-2">
+                        {parts.map((part, partIndex) => {
+                            if (part.startsWith('**') && part.endsWith('**')) {
+                                return <strong key={partIndex}>{part.slice(2, -2)}</strong>;
+                            }
+                            return part;
+                        })}
+                    </div>
+                );
+            }
+
+            // Handle bullet points (lines starting with -)
+            if (line.trim().startsWith('- ')) {
+                return (
+                    <div key={index} className="ml-4 mb-1">
+                        • {line.trim().substring(2)}
+                    </div>
+                );
+            }
+
+            // Handle images ![alt](url)
+            if (line.includes('![') && line.includes('](')) {
+                const imageMatch = line.match(/!\[([^\]]*)\]\(([^)]+)\)/);
+                if (imageMatch) {
+                    const [, alt, url] = imageMatch;
+                    return (
+                        <div key={index} className="my-2">
+                            <Image
+                                src={url}
+                                alt={alt}
+                                width={32}
+                                height={32}
+                                className="w-8 h-8 rounded-full inline-block"
+                                onError={(e: React.SyntheticEvent<HTMLImageElement, Event>) => {
+                                    e.currentTarget.style.display = 'none';
+                                }}
+                            />
+                        </div>
+                    );
+                }
+            }
+
+            // Regular line
+            if (line.trim()) {
+                return <div key={index} className="mb-1">{line}</div>;
+            }
+
+            // Empty line for spacing
+            return <div key={index} className="mb-2"></div>;
+        });
+    };
+
     const scrollToBottom = () => {
         setTimeout(() => {
             if (chatContainerRef.current) {
@@ -230,11 +293,12 @@ export function PromptForm() {
         }]);
     };
 
-    const addAiMessage = (content: string) => {
+    const addAiMessage = (content: string, isFormatted = false) => {
         setMessages(prev => [...prev, {
             type: 'ai',
             content,
-            timestamp: new Date()
+            timestamp: new Date(),
+            isFormatted
         }]);
     };
 
@@ -317,10 +381,55 @@ export function PromptForm() {
                     `Token: ${token.mint}\nBalance: ${token.balance}\nDecimals: ${token.decimals}\n`
                 ).join('\n');
 
-                addAiMessage(`Here are your tokens:\n\n${formattedTokens}`);
+                addAiMessage(`Here are your tokens:\n\n${formattedTokens}`, true);
             } else {
                 addAiMessage('You don\'t have any tokens in your wallet.');
             }
+        }
+    };
+
+    const handleListTrendingTokens = (response: ApiResponse) => {
+        console.log("List trending tokens", response);
+        if (response.response) {
+            // Split the response by numbered items and format each one
+            const lines = response.response.split('\n');
+            let formattedTokens = '';
+            let currentToken = '';
+
+            for (const line of lines) {
+                if (line.trim()) {
+                    // Check if this is a token name line (contains ** and **)
+                    if (line.includes('**') && (line.includes('(') || line.includes(')'))) {
+                        if (currentToken) {
+                            formattedTokens += currentToken + '\n\n';
+                        }
+                        // Extract token name and symbol
+                        const tokenMatch = line.match(/\*\*(.*?)\*\*/);
+                        if (tokenMatch) {
+                            currentToken = `**${tokenMatch[1]}**\n`;
+                        }
+                    } else if (line.includes('Price:')) {
+                        currentToken += `${line.trim()}\n`;
+                    } else if (line.includes('Market Cap:')) {
+                        currentToken += `${line.trim()}\n`;
+                    } else if (line.includes('Liquidity:')) {
+                        currentToken += `${line.trim()}\n`;
+                    } else if (line.includes('Volume')) {
+                        currentToken += `${line.trim()}\n`;
+                    } else if (line.includes('Change') || line.includes('24h')) {
+                        currentToken += `${line.trim()}\n`; // Catches lines with 'Change' or '24h' which often relate to volume or price changes
+                    }
+                }
+            }
+
+            // Add the last token
+            if (currentToken) {
+                formattedTokens += currentToken;
+            }
+
+            addAiMessage(formattedTokens, true); // Pass true for isFormatted
+        } else {
+            addAiMessage('Unable to process list trending tokens request');
         }
     };
 
@@ -333,6 +442,8 @@ export function PromptForm() {
             handleBuyToken(response);
         } else if (response.tool === 'list_my_tokens') {
             handleListTokens();
+        } else if (response.tool === 'list_top_trending_tokens') {
+            handleListTrendingTokens(response);
         } else {
             console.log("Other tool", response);
             addAiMessage(response.response || 'No response available');
@@ -366,7 +477,6 @@ export function PromptForm() {
         }
     };
 
-
     return (
         <div className="w-full max-w-2xl mx-auto p-4 border rounded-lg shadow-sm">
             {!conversationId || !account ?
@@ -391,7 +501,7 @@ export function PromptForm() {
                                         : 'bg-green-700 text-white'
                                         }`}
                                 >
-                                    {message.content}
+                                    {message.isFormatted ? renderFormattedContent(message.content) : message.content}
                                 </div>
                             </div>
                         ))}

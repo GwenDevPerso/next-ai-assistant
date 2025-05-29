@@ -1,19 +1,19 @@
-'use client'
+'use client';
 
-import { ThemeProvider } from './theme-provider'
-import { Toaster } from './ui/sonner'
-import { AppHeader } from '@/components/app-header'
-import React from 'react'
-import { AppFooter } from '@/components/app-footer'
-import { ClusterChecker } from '@/components/cluster/cluster-ui'
-import { AccountChecker } from '@/components/account/account-ui'
+import {ThemeProvider} from './theme-provider';
+import {Toaster} from './ui/sonner';
+import {AppHeader} from '@/components/app-header';
+import React from 'react';
+import {AppFooter} from '@/components/app-footer';
+import {ClusterChecker} from '@/components/cluster/cluster-ui';
+import {AccountChecker} from '@/components/account/account-ui';
 
 export function AppLayout({
   children,
   links,
 }: {
-  children: React.ReactNode
-  links: { label: string; path: string }[]
+  children: React.ReactNode;
+  links: {label: string; path: string;}[];
 }) {
   return (
     <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
@@ -29,5 +29,5 @@ export function AppLayout({
       </div>
       <Toaster />
     </ThemeProvider>
-  )
+  );
 }
