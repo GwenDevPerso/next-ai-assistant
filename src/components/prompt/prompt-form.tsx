@@ -1,11 +1,11 @@
 'use client';
 
-import {useWalletUi} from '@wallet-ui/react';
+import {useWalletUi, useWalletUiCluster} from '@wallet-ui/react';
 import {useState, useRef} from 'react';
 import {useGetBalance, useGetTokenAccounts, useTransferSol} from '../account/account-data-access';
 import {address, lamportsToSol} from 'gill';
 import React from 'react';
-import {Transaction, VersionedTransaction, Connection, clusterApiUrl, TransactionSignature} from '@solana/web3.js';
+import {Transaction, VersionedTransaction, Connection, TransactionSignature} from '@solana/web3.js';
 import Image from 'next/image';
 import {WalletButton} from '../solana/solana-provider';
 
@@ -34,7 +34,7 @@ interface PhantomWallet {
     connect: () => Promise<{publicKey: string;}>;
     disconnect: () => Promise<void>;
     signAndSendTransaction: (
-        transaction: Transaction,
+        transaction: Transaction | VersionedTransaction,
         options?: {skipPreflight: boolean;}
     ) => Promise<{signature: string;}>;
 }
@@ -74,10 +74,13 @@ const links: string[] = [
     'Buy me 1 SOL of usdc token',
     'What is the price of SOL in USD?',
     'Show me a list of all the top trending tokens',
+    'Send 0.01 SOL to [your sol address]'
 ];
 
 function TransactionRequest({data, onSuccess, onCancel}: TransactionRequestProps) {
     const {account} = useWalletUi();
+    const {cluster} = useWalletUiCluster();
+
     const transferSol = useTransferSol({
         address: account?.address ? address(account.address) : address('11111111111111111111111111111111'),
         account: account!
@@ -114,8 +117,14 @@ function TransactionRequest({data, onSuccess, onCancel}: TransactionRequestProps
                         console.log("Attempting to decode transaction");
 
                         // Establish connection to Solana cluster
-                        const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || clusterApiUrl('mainnet-beta');
-                        const connection = new Connection(rpcUrl, 'confirmed');
+                        const rpcUrl = cluster.urlOrMoniker;
+
+                        // Create connection with custom configuration to handle potential WebSocket issues
+                        const connection = new Connection(rpcUrl, {
+                            commitment: 'confirmed',
+                            // Don't use WebSocket for this connection to avoid WSS issues
+                            wsEndpoint: undefined
+                        });
                         console.log("Connection established", connection, rpcUrl);
                         // Decode the base64 transaction
                         const swapTransactionBuf = Buffer.from(data.transaction, 'base64');
@@ -123,29 +132,64 @@ function TransactionRequest({data, onSuccess, onCancel}: TransactionRequestProps
 
                         console.log("Transaction deserialized successfully:", versionedTransaction);
 
-                        // Sign and send the transaction
-                        const signature = await phantom.signAndSendTransaction(
-                            versionedTransaction as unknown as Transaction, // Convert via unknown since types are not directly compatible
-                            {skipPreflight: true}
-                        );
+                        // Use Phantom's signAndSendTransaction with proper VersionedTransaction handling
+                        console.log("Signing and sending transaction with Phantom...");
+
+                        // Phantom supports VersionedTransaction directly in recent versions
+                        // Try the modern approach first
+                        let signature;
+                        try {
+                            // Modern Phantom versions support VersionedTransaction directly
+                            signature = await phantom.signAndSendTransaction(versionedTransaction, {
+                                skipPreflight: true
+                            });
+                        } catch (versionError) {
+                            console.log("Direct VersionedTransaction failed, trying legacy approach:", versionError);
+
+                            // Fallback: convert to legacy transaction if needed
+                            // This is a workaround for older Phantom versions
+                            throw new Error("VersionedTransaction not supported by this wallet version. Please update your wallet.");
+                        }
 
                         console.log("Swap transaction sent with signature:", signature);
 
-                        // Confirm the transaction
-                        // Get the latest blockhash and last valid block height
-                        const {blockhash, lastValidBlockHeight} = await connection.getLatestBlockhash();
-                        const confirmation = await connection.confirmTransaction({
-                            signature: signature.signature as TransactionSignature,
-                            blockhash,
-                            lastValidBlockHeight
-                        }, "finalized");
+                        // Confirm the transaction with better error handling
+                        try {
+                            // Get the latest blockhash and last valid block height
+                            const {blockhash, lastValidBlockHeight} = await connection.getLatestBlockhash();
 
-                        if (confirmation.value.err) {
-                            throw new Error(`Transaction failed to confirm: ${JSON.stringify(confirmation.value.err)}`);
+                            // Use a more robust confirmation strategy
+                            const confirmation = await connection.confirmTransaction({
+                                signature: signature.signature as TransactionSignature,
+                                blockhash,
+                                lastValidBlockHeight
+                            }, "confirmed"); // Use "confirmed" instead of "finalized" for faster confirmation
+
+                            if (confirmation.value.err) {
+                                throw new Error(`Transaction failed to confirm: ${JSON.stringify(confirmation.value.err)}`);
+                            }
+
+                            console.log(`Transaction successful: https://solscan.io/tx/${signature.signature}`);
+                            onSuccess();
+                        } catch (confirmError) {
+                            console.warn("Transaction confirmation failed, but transaction was sent:", confirmError);
+
+                            // Even if confirmation fails, the transaction might have succeeded
+                            // Let's check the transaction status directly
+                            try {
+                                const txStatus = await connection.getSignatureStatus(signature.signature as TransactionSignature);
+                                if (txStatus.value?.confirmationStatus === 'confirmed' || txStatus.value?.confirmationStatus === 'finalized') {
+                                    console.log(`Transaction was actually successful: https://solscan.io/tx/${signature.signature}`);
+                                    onSuccess();
+                                    return;
+                                }
+                            } catch (statusError) {
+                                console.error("Could not check transaction status:", statusError);
+                            }
+
+                            // If we can't confirm success, treat as error but provide helpful message
+                            throw new Error(`Transaction sent but confirmation uncertain. Check status: https://solscan.io/tx/${signature.signature}`);
                         }
-
-                        console.log(`Transaction successful: https://solscan.io/tx/${signature}`);
-                        onSuccess();
                     } catch (error) {
                         console.error("Error sending swap transaction:", error);
                         onCancel();
